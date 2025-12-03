@@ -27,6 +27,9 @@ mvn spring-boot:run
 
 
 
+“Before running the backend, add your Zoom API credentials (client_id, client_secret, account_id, and r) inside src/main/resources/application.properties.”
+
+
 src/
  └── main/
       ├── java/com/zoomdash
