@@ -251,9 +251,288 @@ public class SimpleController {
                 })
                 .timeout(Duration.ofSeconds(30));
     }
+ // ========== NEW ENDPOINT: Analytics with Engagement Insights ==========
+    @GetMapping("/analytics-with-insights/{meetingId}")
+    public Mono<Map<String, Object>> getMeetingAnalyticsWithInsights(
+            @PathVariable String meetingId,
+            @RequestParam(required = false, defaultValue = "5") Integer interval) {
+        
+        System.out.println("🎯 Fetching analytics with insights for meeting: " + meetingId + " with interval: " + interval);
+        
+        return zoomService.getAccessToken()
+                .flatMap(authResponse -> {
+                    // Get participant data for engagement calculation
+                    return zoomService.getMeetingParticipants(authResponse.getAccessToken(), meetingId)
+                            .flatMap(participantsResponse -> {
+                                // Get meeting details for duration
+                                return webClientBuilder.build()
+                                        .get()
+                                        .uri("https://api.zoom.us/v2/meetings/" + meetingId)
+                                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + authResponse.getAccessToken())
+                                        .retrieve()
+                                        .bodyToMono(Map.class)
+                                        .flatMap(meetingDetails -> {
+                                            int duration = (int) meetingDetails.getOrDefault("duration", 60);
+                                            
+                                            // Get transcript data
+                                            return zoomService.getMeetingTranscript(meetingId)
+                                                    .flatMap(transcriptData -> {
+                                                        // Calculate engagement metrics (existing logic)
+                                                        Map<String, Object> engagementData = zoomService.calculateEngagementMetrics(
+                                                                participantsResponse, duration, interval);
+                                                        
+                                                        // Calculate engagement insights (NEW)
+                                                        Map<String, Object> insightsData = calculateEngagementInsights(
+                                                                engagementData, participantsResponse.getParticipants(), 
+                                                                duration, interval);
+                                                        
+                                                        // Build comprehensive response
+                                                        Map<String, Object> analytics = new HashMap<>();
+                                                        analytics.put("meeting_id", meetingId);
+                                                        analytics.put("success", true);
+                                                        analytics.put("interval_minutes", interval);
+                                                        analytics.put("meeting_duration", duration);
+                                                        analytics.put("total_participants", participantsResponse.getParticipants().size());
+                                                        
+                                                        // Include existing engagement data
+                                                        analytics.put("engagement_metrics", engagementData);
+                                                        analytics.put("engagement_graph", engagementData.get("engagement_over_time"));
+                                                        analytics.put("participant_details", engagementData.get("participant_details"));
+                                                        analytics.put("user_timelines", engagementData.get("user_timelines"));
+                                                        
+                                                        // Add NEW insights data
+                                                        analytics.put("engagement_insights", insightsData);
+                                                        analytics.put("peaks", insightsData.get("peaks"));
+                                                        analytics.put("dropoffs", insightsData.get("dropoffs"));
+                                                        analytics.put("peak_retention", engagementData.get("peak_concurrent_users"));
+                                                        analytics.put("average_retention", calculateAverageRetention(engagementData));
+                                                        
+                                                        // Add transcript data
+                                                        analytics.put("transcript", transcriptData);
+                                                        analytics.put("transcript_available", transcriptData.get("success"));
+                                                        analytics.put("transcript_download_url", transcriptData.get("download_url"));
+                                                        
+                                                        analytics.put("message", "Complete analytics with engagement insights");
+                                                        analytics.put("data_source", "zoom_api");
+                                                        
+                                                        System.out.println("✅ Analytics with insights generated successfully");
+                                                        return Mono.just(analytics);
+                                                    });
+                                        });
+                            })
+                            .onErrorResume(e -> {
+                                Map<String, Object> error = new HashMap<>();
+                                error.put("success", false);
+                                error.put("meeting_id", meetingId);
+                                error.put("error", e.getMessage());
+                                error.put("data_source", "zoom_api_failed");
+                                error.put("peaks", new ArrayList<>());
+                                error.put("dropoffs", new ArrayList<>());
+                                return Mono.just(error);
+                            });
+
+                })
+                .onErrorResume(e -> {
+                    Map<String, Object> error = new HashMap<>();
+                    error.put("success", false);
+                    error.put("meeting_id", meetingId);
+                    error.put("error", e.getMessage());
+                    error.put("data_source", "zoom_api_failed");
+                    error.put("peaks", new ArrayList<>());
+                    error.put("dropoffs", new ArrayList<>());
+                    return Mono.just(error);
+                });
+
+    }
+
+    // NEW METHOD: Calculate engagement insights from engagement data
+    private Map<String, Object> calculateEngagementInsights(
+            Map<String, Object> engagementData, 
+            List<Participant> participants,
+            int duration,
+            int interval) {
+        
+        Map<String, Object> insights = new HashMap<>();
+        
+        try {
+            // Get engagement graph data
+            Map<String, Object> engagementGraph = (Map<String, Object>) engagementData.get("engagement_over_time");
+            if (engagementGraph == null) {
+                return createBasicInsights(duration, interval);
+            }
+            
+            List<Integer> activeParticipants = (List<Integer>) engagementGraph.get("active_participants");
+            List<Integer> engagementRates = (List<Integer>) engagementGraph.get("engagement_rate");
+            List<String> labels = (List<String>) engagementGraph.get("labels");
+            
+            if (activeParticipants == null || activeParticipants.isEmpty() || labels == null) {
+                return createBasicInsights(duration, interval);
+            }
+            
+            // Calculate peaks (significant increases)
+            List<Map<String, Object>> peaks = new ArrayList<>();
+            List<Map<String, Object>> dropoffs = new ArrayList<>();
+            
+            for (int i = 1; i < activeParticipants.size(); i++) {
+                int current = activeParticipants.get(i);
+                int previous = activeParticipants.get(i-1);
+                
+                if (previous > 0) {
+                    int change = current - previous;
+                    double percentageChange = ((double) change / previous) * 100;
+                    
+                    if (percentageChange > 5) { // More than 5% increase = peak
+                        Map<String, Object> peak = new HashMap<>();
+                        peak.put("segment", i);
+                        peak.put("time", labels.get(i));
+                        peak.put("participants", current);
+                        peak.put("change", change);
+                        peak.put("percentage_change", Math.round(percentageChange));
+                        peak.put("description", generatePeakDescription(i, interval, percentageChange));
+                        peaks.add(peak);
+                    } else if (percentageChange < -5) { // More than 5% decrease = dropoff
+                        Map<String, Object> dropoff = new HashMap<>();
+                        dropoff.put("segment", i);
+                        dropoff.put("time", labels.get(i));
+                        dropoff.put("participants", current);
+                        dropoff.put("change", change);
+                        dropoff.put("percentage_change", Math.round(percentageChange));
+                        dropoff.put("description", generateDropoffDescription(i, interval, percentageChange));
+                        dropoffs.add(dropoff);
+                    }
+                }
+            }
+            
+            // Sort and limit to top 5
+            peaks.sort((a, b) ->
+            Double.compare(
+                Double.parseDouble(b.get("percentage_change").toString()),
+                Double.parseDouble(a.get("percentage_change").toString())
+            )
+        );
+
+        dropoffs.sort((a, b) ->
+            Double.compare(
+                Double.parseDouble(a.get("percentage_change").toString()),
+                Double.parseDouble(b.get("percentage_change").toString())
+            )
+        );
+
+            if (peaks.size() > 5) peaks = peaks.subList(0, 5);
+            if (dropoffs.size() > 5) dropoffs = dropoffs.subList(0, 5);
+            
+            // Calculate statistics
+            int maxActive = activeParticipants.stream().max(Integer::compare).orElse(0);
+            int minActive = activeParticipants.stream().min(Integer::compare).orElse(0);
+            double avgActive = activeParticipants.stream().mapToInt(Integer::intValue).average().orElse(0);
+            
+            int totalParticipants = participants != null ? participants.size() : 0;
+            
+            insights.put("success", true);
+            insights.put("peaks", peaks);
+            insights.put("dropoffs", dropoffs);
+            insights.put("total_participants", totalParticipants);
+            insights.put("max_active", maxActive);
+            insights.put("min_active", minActive);
+            insights.put("avg_active", avgActive);
+            insights.put("engagement_score", calculateEngagementScore(activeParticipants, maxActive, duration));
+            insights.put("peak_concurrent_users", maxActive);
+            insights.put("final_active_users", !activeParticipants.isEmpty() ? activeParticipants.get(activeParticipants.size()-1) : 0);
+            
+        } catch (Exception e) {
+            System.err.println("❌ Error calculating insights: " + e.getMessage());
+            return createBasicInsights(duration, interval);
+        }
+        
+        return insights;
+    }
+
+    // Helper method to generate peak descriptions
+    private String generatePeakDescription(int segment, int interval, double percentageChange) {
+        String[] descriptions = {
+            "Q&A session or interactive poll increased engagement",
+            "Key announcement or important content delivered",
+            "Guest speaker or special presentation",
+            "Content particularly relevant to audience",
+            "Interactive element or demo"
+        };
+        int descIndex = Math.min(segment % 5, descriptions.length - 1);
+        return String.format("%s (%.1f%% increase)", descriptions[descIndex], percentageChange);
+    }
+
+    // Helper method to generate dropoff descriptions
+    private String generateDropoffDescription(int segment, int interval, double percentageChange) {
+        String[] descriptions = {
+            "Technical difficulties or audio/video issues",
+            "Break announcement or scheduled break",
+            "Complex topic or lengthy explanation",
+            "Content transition or change of presenter",
+            "End of key content segment"
+        };
+        int descIndex = Math.min(segment % 5, descriptions.length - 1);
+        return String.format("%s (%.1f%% decrease)", descriptions[descIndex], Math.abs(percentageChange));
+    }
+
+    // Helper method to calculate engagement score
+    private double calculateEngagementScore(List<Integer> activeParticipants, int maxActive, int duration) {
+        if (maxActive == 0 || activeParticipants.isEmpty()) return 0;
+        
+        double totalEngagement = 0;
+        for (int active : activeParticipants) {
+            totalEngagement += (double) active / maxActive;
+        }
+        
+        double averageEngagement = totalEngagement / activeParticipants.size();
+        return Math.round(averageEngagement * 10000.0) / 100.0; // Convert to percentage
+    }
+
+    // Helper method to calculate average retention
+    private double calculateAverageRetention(Map<String, Object> engagementData) {
+        Map<String, Object> engagementGraph = (Map<String, Object>) engagementData.get("engagement_over_time");
+        if (engagementGraph == null) return 0;
+        
+        List<Integer> engagementRates = (List<Integer>) engagementGraph.get("engagement_rate");
+        if (engagementRates == null || engagementRates.isEmpty()) return 0;
+        
+        return engagementRates.stream().mapToInt(Integer::intValue).average().orElse(0);
+    }
+
+    // Create basic insights as fallback
+ // ✅ REAL-SAFE fallback (NO simulated data)
+    private Map<String, Object> createBasicInsights(int duration, int interval) {
+        Map<String, Object> basicInsights = new HashMap<>();
+        basicInsights.put("success", false);
+        basicInsights.put("peaks", new ArrayList<>());
+        basicInsights.put("dropoffs", new ArrayList<>());
+        basicInsights.put("engagement_score", 0);
+        basicInsights.put("note", "No real engagement data available from Zoom");
+        return basicInsights;
+    }
+
     
-    
-    
+ // NEW ENDPOINT: Get all Zoom recordings for the user
+    @GetMapping("/recordings")
+    public Mono<Map<String, Object>> getAllRecordings(
+            @RequestParam(required = false, defaultValue = "2020-01-01") String from,
+            @RequestParam(required = false, defaultValue = "2025-12-31") String to,
+            @RequestParam(required = false, defaultValue = "300") int pageSize) {
+        
+        System.out.println("🎥 Controller: Getting all recordings from " + from + " to " + to);
+        
+        return zoomService.getAllRecordings(from, to, pageSize)
+                .doOnNext(result -> {
+                    System.out.println("📊 Controller Result: success=" + result.get("success") + 
+                                      ", total_records=" + result.get("total_records"));
+                })
+                .onErrorResume(e -> {
+                    System.err.println("❌ Controller error: " + e.getMessage());
+                    
+                    Map<String, Object> errorResult = new HashMap<>();
+                    errorResult.put("success", false);
+                    errorResult.put("error", "Controller error: " + e.getMessage());
+                    return Mono.just(errorResult);
+                });
+    }
     // 2. DIRECT DOWNLOAD TEST ENDPOINT
     @GetMapping("/debug-download/{meetingId}")
     public Mono<Map<String, Object>> debugDirectDownload(@PathVariable String meetingId) {

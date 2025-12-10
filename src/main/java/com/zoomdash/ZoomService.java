@@ -11,6 +11,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
+import java.util.stream.Collectors;
 
 @Service
 public class ZoomService {
@@ -53,14 +54,80 @@ public class ZoomService {
                 .retrieve()
                 .bodyToMono(ZoomMeetingsResponse.class);
     }
+    private Flux<ParticipantsResponse> getAllMeetingParticipants(
+            String accessToken,
+            String meetingId,
+            String nextPageToken
+    ) {
+        String uri = "https://api.zoom.us/v2/report/meetings/" + meetingId + "/participants";
+
+        if (nextPageToken != null && !nextPageToken.isEmpty()) {
+            uri += "?next_page_token=" + nextPageToken;
+        }
+
+        System.out.println("🎯 Fetching Meeting Page: " + uri);
+
+        return webClient.get()
+                .uri(uri)
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + accessToken)
+                .retrieve()
+                .bodyToMono(ParticipantsResponse.class)
+                .flatMapMany(response -> {
+                    if (response.getNextPageToken() != null && !response.getNextPageToken().isEmpty()) {
+                        return Flux.concat(
+                                Flux.just(response),
+                                getAllMeetingParticipants(accessToken, meetingId, response.getNextPageToken())
+                        );
+                    } else {
+                        return Flux.just(response);
+                    }
+                });
+    }
 
     // Get Meeting Participants
     public Mono<ParticipantsResponse> getMeetingParticipants(String accessToken, String meetingId) {
-        return webClient.get()
-                .uri("https://api.zoom.us/v2/report/meetings/" + meetingId + "/participants")
-                .header(HttpHeaders.AUTHORIZATION, "Bearer " + accessToken)
-                .retrieve()
-                .bodyToMono(ParticipantsResponse.class);
+        System.out.println("🚀 Starting MEETING pagination for: " + meetingId);
+
+        return getAllMeetingParticipants(accessToken, meetingId, null)
+                .collectList()
+                .map(responses -> {
+                    ParticipantsResponse combined = new ParticipantsResponse();
+                    List<Participant> all = new ArrayList<>();
+
+                    for (ParticipantsResponse r : responses) {
+                        if (r.getParticipants() != null) {
+                            all.addAll(r.getParticipants());
+                        }
+                    }
+
+                    combined.setParticipants(all);
+                    combined.setTotalRecords(all.size());
+
+                    System.out.println("✅ TOTAL REAL MEETING PARTICIPANTS LOADED: " + all.size());
+                    return combined;
+                });
+    }
+
+    private int calculateMeetingDurationFromParticipants(List<Participant> participants) {
+        LocalDateTime minJoin = null;
+        LocalDateTime maxLeave = null;
+
+        for (Participant p : participants) {
+            try {
+                LocalDateTime join = LocalDateTime.parse(p.getJoinTime(), ZOOM_TIME_FORMATTER);
+                LocalDateTime leave = LocalDateTime.parse(p.getLeaveTime(), ZOOM_TIME_FORMATTER);
+
+                if (minJoin == null || join.isBefore(minJoin)) minJoin = join;
+                if (maxLeave == null || leave.isAfter(maxLeave)) maxLeave = leave;
+
+            } catch (Exception e) {
+                System.err.println("⚠️ Skipping invalid time for: " + p.getName());
+            }
+        }
+
+        int duration = (int) Duration.between(minJoin, maxLeave).toMinutes();
+        System.out.println("⏱️ REAL MEETING DURATION CALCULATED: " + duration + " minutes");
+        return Math.max(duration, 1);
     }
 
     // Calculate REAL Engagement Metrics with ACTUAL Join/Leave Times AND Individual User Tracking
@@ -142,6 +209,12 @@ public class ZoomService {
         engagementData.put("total_left", realTimeAnalysis.get("total_left"));
         engagementData.put("engagement_over_time", engagementGraph);
         engagementData.put("participant_details", participantDetails); // Detailed user information
+     // ✅ ADD REAL PEAKS & DROPOFFS HERE
+        Map<String, List<Map<String, Object>>> insights =
+                calculatePeaksAndDropoffsFromGraph(activeParticipants, timeLabels);
+
+        engagementData.put("peaks", insights.get("peaks"));
+        engagementData.put("dropoffs", insights.get("dropoffs"));
 
         return engagementData;
     }
@@ -407,96 +480,61 @@ public class ZoomService {
 
     // Get Complete Meeting Analytics with Participant Details - UPDATED to accept interval
     public Mono<Map<String, Object>> getMeetingAnalytics(String meetingId, Integer intervalMinutes) {
-        int interval = intervalMinutes != null ? intervalMinutes : 5; // Default to 5 minutes
-        
+        int interval = intervalMinutes != null ? intervalMinutes : 5;
+
         return getAccessToken()
-                .flatMap(authResponse -> {
-                    // Get transcript data FIRST and include it in analytics
-                    return getMeetingTranscript(meetingId)
-                            .flatMap(transcriptData -> {
-                                System.out.println("🎤 Transcript data retrieved for analytics: " + transcriptData.get("success"));
-                                
-                                // Then get participant data and analytics
-                                return getMeetingParticipants(authResponse.getAccessToken(), meetingId)
-                                        .map(participantsResponse -> {
-                                            Map<String, Object> analytics = new HashMap<>();
-                                            // Default meeting duration if not available
-                                            int meetingDuration = 60; // default 1 hour
-                                            Map<String, Object> engagementData = calculateEngagementMetrics(participantsResponse, meetingDuration, interval);
-                                            
-                                            analytics.put("meeting_id", meetingId);
-                                            analytics.put("success", true);
-                                            analytics.put("interval_minutes", interval);
-                                            analytics.put("total_participants", engagementData.get("total_participants"));
-                                            analytics.put("engagement_metrics", engagementData);
-                                            analytics.put("engagement_graph", engagementData.get("engagement_over_time"));
-                                            analytics.put("participant_details", engagementData.get("participant_details"));
-                                            analytics.put("user_timelines", engagementData.get("user_timelines"));
-                                            
-                                            // ADD TRANSCRIPT DATA TO ANALYTICS
-                                            analytics.put("transcript", transcriptData);
-                                            analytics.put("transcript_available", transcriptData.get("success"));
-                                            analytics.put("transcript_download_url", transcriptData.get("download_url"));
-                                            
-                                            analytics.put("message", "Real participant data analyzed with individual user tracking");
-                                            analytics.put("data_source", "zoom_api");
-                                            
-                                            // Add real-time specific metrics
-                                            analytics.put("peak_concurrent_users", engagementData.get("peak_concurrent_users"));
-                                            analytics.put("final_active_users", engagementData.get("final_active_users"));
-                                            analytics.put("total_joined", engagementData.get("total_joined"));
-                                            analytics.put("total_left", engagementData.get("total_left"));
-                                            
-                                            System.out.println("✅ Analytics response includes transcript: " + analytics.containsKey("transcript"));
-                                            return analytics;
-                                        })
-                                        .onErrorResume(e -> {
-                                            System.err.println("❌ Error getting real meeting data: " + e.getMessage());
-                                            // Even if analytics fail, return transcript data
-                                            Map<String, Object> fallbackAnalytics = new HashMap<>();
-                                            fallbackAnalytics.put("meeting_id", meetingId);
-                                            fallbackAnalytics.put("success", false);
-                                            fallbackAnalytics.put("error", "Analytics failed but transcript available");
-                                            fallbackAnalytics.put("transcript", transcriptData);
-                                            fallbackAnalytics.put("transcript_available", transcriptData.get("success"));
-                                            return Mono.just(fallbackAnalytics);
-                                        });
+            .flatMap(authResponse ->
+                getMeetingTranscript(meetingId)
+                    .flatMap(transcriptData ->
+                        getMeetingParticipants(authResponse.getAccessToken(), meetingId)
+                            .map(participantsResponse -> {
+
+                            	int meetingDuration =
+                            		    calculateMeetingDurationFromParticipants(participantsResponse.getParticipants());
+
+                                Map<String, Object> engagementData =
+                                        calculateEngagementMetrics(participantsResponse, meetingDuration, interval);
+
+                                Map<String, Object> analytics = new HashMap<>();
+                                analytics.put("meeting_id", meetingId);
+                                analytics.put("success", true);
+                                analytics.put("interval_minutes", interval);
+                                analytics.put("total_participants", engagementData.get("total_participants"));
+                                analytics.put("engagement_metrics", engagementData);
+                                analytics.put("engagement_graph", engagementData.get("engagement_over_time"));
+                                analytics.put("participant_details", engagementData.get("participant_details"));
+                                analytics.put("user_timelines", engagementData.get("user_timelines"));
+                                analytics.put("peaks", engagementData.get("peaks"));
+                                analytics.put("dropoffs", engagementData.get("dropoffs"));
+
+                                analytics.put("transcript", transcriptData);
+                                analytics.put("transcript_available", transcriptData.get("success"));
+                                analytics.put("transcript_download_url", transcriptData.get("download_url"));
+
+                                analytics.put("message", "REAL Zoom participant analytics");
+                                analytics.put("data_source", "zoom_api");
+
+                                analytics.put("peak_concurrent_users", engagementData.get("peak_concurrent_users"));
+                                analytics.put("final_active_users", engagementData.get("final_active_users"));
+                                analytics.put("total_joined", engagementData.get("total_joined"));
+                                analytics.put("total_left", engagementData.get("total_left"));
+
+                                return analytics;
                             })
-                            .onErrorResume(e -> {
-                                System.err.println("❌ Error getting transcript for analytics: " + e.getMessage());
-                                // If transcript fails, try to get analytics without transcript
-                                return getMeetingParticipants(authResponse.getAccessToken(), meetingId)
-                                        .map(participantsResponse -> {
-                                            Map<String, Object> analytics = new HashMap<>();
-                                            int meetingDuration = 60;
-                                            Map<String, Object> engagementData = calculateEngagementMetrics(participantsResponse, meetingDuration, interval);
-                                            
-                                            analytics.put("meeting_id", meetingId);
-                                            analytics.put("success", true);
-                                            analytics.put("interval_minutes", interval);
-                                            analytics.put("total_participants", engagementData.get("total_participants"));
-                                            analytics.put("engagement_metrics", engagementData);
-                                            analytics.put("engagement_graph", engagementData.get("engagement_over_time"));
-                                            analytics.put("participant_details", engagementData.get("participant_details"));
-                                            analytics.put("user_timelines", engagementData.get("user_timelines"));
-                                            analytics.put("message", "Real participant data analyzed (transcript unavailable)");
-                                            analytics.put("data_source", "zoom_api");
-                                            analytics.put("transcript_available", false);
-                                            analytics.put("transcript_error", "Failed to load transcript: " + e.getMessage());
-                                            
-                                            return analytics;
-                                        })
-                                        .onErrorResume(e2 -> {
-                                            System.err.println("❌ Both transcript and analytics failed: " + e2.getMessage());
-                                            return generateSimulatedAnalytics(meetingId, interval);
-                                        });
-                            });
-                })
-                .onErrorResume(e -> {
-                    System.err.println("❌ Error in meeting analytics: " + e.getMessage());
-                    return generateSimulatedAnalytics(meetingId, interval);
-                });
+                    )
+            )
+            .onErrorResume(e -> {
+                System.err.println("❌ REAL Zoom Analytics Failed: " + e.getMessage());
+
+                Map<String, Object> error = new HashMap<>();
+                error.put("success", false);
+                error.put("meeting_id", meetingId);
+                error.put("error", "Real Zoom analytics failed");
+                error.put("data_source", "zoom_api");
+                return Mono.just(error);
+            });
     }
+
 
     // Generate simulated analytics when real data is not available - UPDATED to accept interval
     private Mono<Map<String, Object>> generateSimulatedAnalytics(String meetingId, int intervalMinutes) {
@@ -854,9 +892,101 @@ public class ZoomService {
                 });
     }
     
+ // NEW METHOD: Get all recordings
+    public Mono<Map<String, Object>> getAllRecordings(String from, String to, int pageSize) {
+        System.out.println("🎥 Getting all recordings from " + from + " to " + to);
+        
+        return getAccessToken()
+                .flatMap(authResponse -> {
+                    String url = "https://api.zoom.us/v2/users/me/recordings" +
+                               "?from=" + from +
+                               "&to=" + to +
+                               "&page_size=" + pageSize;
+                    
+                    System.out.println("🔗 API URL: " + url);
+                    
+                    return webClient.get()
+                            .uri(url)
+                            .header(HttpHeaders.AUTHORIZATION, "Bearer " + authResponse.getAccessToken())
+                            .retrieve()
+                            .bodyToMono(ZoomRecordingsListResponse.class)
+                            .map(recordingsResponse -> {
+                                System.out.println("✅ Successfully fetched " + 
+                                        recordingsResponse.getTotalRecords() + " recordings");
+                                
+                                Map<String, Object> result = new HashMap<>();
+                                result.put("success", true);
+                                result.put("total_records", recordingsResponse.getTotalRecords());
+                                result.put("page_size", recordingsResponse.getPageSize());
+                                result.put("page_count", recordingsResponse.getPageCount());
+                                result.put("next_page_token", recordingsResponse.getNextPageToken());
+                                result.put("meetings", recordingsResponse.getMeetings());
+                                result.put("from", recordingsResponse.getFrom());
+                                result.put("to", recordingsResponse.getTo());
+                                return result;
+                            })
+                            .onErrorResume(e -> {
+                                System.err.println("❌ Error fetching recordings: " + e.getMessage());
+                                e.printStackTrace();
+                                
+                                Map<String, Object> errorResult = new HashMap<>();
+                                errorResult.put("success", false);
+                                errorResult.put("error", "Failed to fetch recordings: " + e.getMessage());
+                                return Mono.just(errorResult);
+                            });
+                })
+                .onErrorResume(e -> {
+                    System.err.println("❌ Auth error for recordings: " + e.getMessage());
+                    
+                    Map<String, Object> errorResult = new HashMap<>();
+                    errorResult.put("success", false);
+                    errorResult.put("error", "Authentication failed: " + e.getMessage());
+                    return Mono.just(errorResult);
+                });
+    }
+    
+    private Map<String, List<Map<String, Object>>> calculatePeaksAndDropoffsFromGraph(
+            List<Integer> activeParticipants,
+            List<String> timeLabels
+    ) {
+        List<Map<String, Object>> peaks = new ArrayList<>();
+        List<Map<String, Object>> dropoffs = new ArrayList<>();
+
+        for (int i = 1; i < activeParticipants.size(); i++) {
+            int prev = activeParticipants.get(i - 1);
+            int curr = activeParticipants.get(i);
+
+            if (prev == 0) continue;
+
+            int change = curr - prev;
+            double percentageChange = (change * 100.0) / prev;
+
+            Map<String, Object> insight = new HashMap<>();
+            insight.put("time", timeLabels.get(i));
+            insight.put("participants", curr);
+            insight.put("change", change);
+            insight.put("percentage_change", Math.round(percentageChange));
+
+            if (percentageChange >= 5) {
+                insight.put("description", "Engagement spike detected");
+                peaks.add(insight);
+            } else if (percentageChange <= -5) {
+                insight.put("description", "User drop-off detected");
+                dropoffs.add(insight);
+            }
+        }
+
+        Map<String, List<Map<String, Object>>> result = new HashMap<>();
+        result.put("peaks", peaks.stream().limit(5).collect(Collectors.toList()));
+        result.put("dropoffs", dropoffs.stream().limit(5).collect(Collectors.toList()));
+
+        return result;
+    }
+
+    
     // ========== TRANSCRIPT METHODS ==========
     
-    // Get Meeting Transcript - SIMPLE VERSION (Returns download URL for frontend)
+    // Get Meeting Transcript - SIMPLE VERSION 
     public Mono<Map<String, Object>> getMeetingTranscript(String meetingId) {
         System.out.println("🎯 SIMPLE getMeetingTranscript for: " + meetingId);
 
